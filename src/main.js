@@ -53,7 +53,7 @@ marker.on('dragend', (e) => marker.setTooltipContent(formatCoords(e.target.getLa
 // ---------------------------------------------------------------------------
 // Grid polygon — geo-anchored bounds, drag body + drag corners to resize
 // ---------------------------------------------------------------------------
-const DIVISIONS = 5;
+const DIVISIONS = 6;
 const GRID_COLOR = '#707070';
 const INNER_COUNT = (DIVISIONS - 1) * 2; // 4 vertical + 4 horizontal
 
@@ -546,67 +546,76 @@ async function runCloudrfCells() {
     className: '', iconSize: [0, 0], iconAnchor: [0, 0],
   }));
 
-  // Phase 1 — fetch all cells and collect stddevs
+  // Phase 1 — stagger requests 100 ms apart; responses can arrive in any order.
+  // Each closure captures its own cell index i so results are always written to the right slot.
   const stddevs = new Array(total).fill(null);
+  const cellRes = computeRes();
+  let completed = 0;
 
-  for (let i = 0; i < total; i++) {
-    const r   = Math.floor(i / DIVISIONS);
-    const c   = i % DIVISIONS;
-    const cS  = south + (north - south) * r       / DIVISIONS;
-    const cN  = south + (north - south) * (r + 1) / DIVISIONS;
-    const cW  = west  + (east  - west)  * c       / DIVISIONS;
-    const cE  = west  + (east  - west)  * (c + 1) / DIVISIONS;
-    const rxLat = (cS + cN) / 2;
-    const rxLon = (cW + cE) / 2;
+  btn.title = `CloudRF — 0 of ${total} complete`;
 
-    btn.title = `CloudRF — cell ${i + 1} of ${total}`;
-    cells[i].setStyle({ fillColor: '#1c1c1c', fillOpacity: 0.75, color: 'transparent', weight: 0 });
-
+  await Promise.all(Array.from({ length: total }, (_, i) => new Promise(resolve => {
+    const r    = Math.floor(i / DIVISIONS);
+    const c    = i % DIVISIONS;
+    const cS   = south + (north - south) * r       / DIVISIONS;
+    const cN   = south + (north - south) * (r + 1) / DIVISIONS;
+    const cW   = west  + (east  - west)  * c       / DIVISIONS;
+    const cE   = west  + (east  - west)  * (c + 1) / DIVISIONS;
     const body = {
       ...radioTemplate,
       transmitter: { ...radioTemplate.transmitter },
-      output:      { ...radioTemplate.output, res: computeRes() },
+      output:      { ...radioTemplate.output, res: cellRes },
       points:      txPts,
-      receiver:    { ...radioTemplate.receiver, lat: rxLat, lon: rxLon },
+      receiver:    { ...radioTemplate.receiver, lat: (cS + cN) / 2, lon: (cW + cE) / 2 },
     };
 
-    try {
-      const t0  = performance.now();
-      const res = await fetch(`${server}/points`, {
-        method: 'POST',
-        headers: { 'key': apiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+    setTimeout(async () => {
+      // darken this cell when its request fires, not all at once up front
+      cells[i].setStyle({ fillColor: '#1c1c1c', fillOpacity: 0.75, color: 'transparent', weight: 0 });
+      try {
+        const t0   = performance.now();
+        const resp = await fetch(`${server}/points`, {
+          method: 'POST',
+          headers: { 'key': apiKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      totalApiMs += performance.now() - t0;
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        totalApiMs += performance.now() - t0;
 
-      const txResults = data?.Transmitters ?? [];
-      totalApiCalls++;
-      totalPaths += txResults.length;
-      const avgMs = Math.round(totalApiMs / totalApiCalls);
-      document.getElementById('api-stats').textContent =
-        `${totalApiCalls} call${totalApiCalls !== 1 ? 's' : ''} · ${totalPaths} path${totalPaths !== 1 ? 's' : ''}`;
-      document.getElementById('api-avg-time').textContent =
-        `avg ${avgMs < 1000 ? `${avgMs} ms` : `${(avgMs / 1000).toFixed(1)} s`} / call`;
+        const txResults = data?.Transmitters ?? [];
+        totalApiCalls++;
+        totalPaths += txResults.length;
+        completed++;
 
-      const diffs = keptPoints
-        .map((p, j) => {
-          const pred = txResults[j]?.['Signal power at receiver dBm'];
-          return pred != null ? p.rssi - pred : null;
-        })
-        .filter(d => d !== null);
+        const avgMs = Math.round(totalApiMs / totalApiCalls);
+        btn.title = `CloudRF — ${completed} of ${total} complete`;
+        document.getElementById('api-stats').textContent =
+          `${totalApiCalls} call${totalApiCalls !== 1 ? 's' : ''} · ${totalPaths} path${totalPaths !== 1 ? 's' : ''}`;
+        document.getElementById('api-avg-time').textContent =
+          `avg ${avgMs < 1000 ? `${avgMs} ms` : `${(avgMs / 1000).toFixed(1)} s`} / call`;
 
-      if (diffs.length > 0) {
-        const mean     = diffs.reduce((s, d) => s + d, 0) / diffs.length;
-        const variance = diffs.reduce((s, d) => s + (d - mean) ** 2, 0) / diffs.length;
-        stddevs[i] = Math.sqrt(variance);
+        const diffs = keptPoints
+          .map((p, j) => {
+            const pred = txResults[j]?.['Signal power at receiver dBm'];
+            return pred != null ? p.rssi - pred : null;
+          })
+          .filter(d => d !== null);
+
+        if (diffs.length > 0) {
+          const mean     = diffs.reduce((s, d) => s + d, 0) / diffs.length;
+          const variance = diffs.reduce((s, d) => s + (d - mean) ** 2, 0) / diffs.length;
+          stddevs[i] = Math.sqrt(variance);
+          // colour immediately using the provisional fixed scale; Phase 2 recolours with the true scale
+          cells[i].setStyle({ fillColor: stddevToFireColor(stddevs[i], 5, 15), fillOpacity: 0.82, color: 'transparent', weight: 0 });
+        }
+      } catch (err) {
+        console.error(`CloudRF cell ${i} error:`, err);
       }
-    } catch (err) {
-      console.error(`CloudRF cell ${i} error:`, err);
-    }
-  }
+      resolve();
+    }, i * 80);
+  })));
 
   // Phase 2 — colour scale: fixed 5–15 dB if any cell exceeds 15 dB, otherwise 5–actualMax
   const validStddevs = stddevs.filter(v => v !== null);
